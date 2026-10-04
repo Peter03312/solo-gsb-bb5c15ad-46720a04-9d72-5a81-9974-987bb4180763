@@ -11,10 +11,11 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .audit import run_audit
-from .planner import Course, PlanError, build_plan, parse_semester
+from .batch_planner import build_batch
+from .planner import Course, PlanError, build_plan, format_schedule, parse_semester
 from .program_plan import build_program_plan
 from .replan import replan_plan, replan_program_plan
-from .schemas import (AuditIn, CatalogIn, PlanIn, ProgramPlanIn, ReplanIn,
+from .schemas import (AuditIn, BatchIn, CatalogIn, PlanIn, ProgramPlanIn, ReplanIn,
                       RequirementVersionIn, SeatCapIn)
 
 
@@ -77,6 +78,8 @@ def _plan_out(row):
         out["plan_type"] = "program_plan"
         out["requirement_version_id"] = request_data.get("requirement_version_id")
         out["bound_catalog_version"] = request_data.get("bound_catalog_version")
+    if "batch_id" in row.keys() and row["batch_id"]:
+        out["batch_id"] = row["batch_id"]
     return out
 
 
@@ -529,7 +532,255 @@ def list_plans():
         }
         if r["source_plan_id"]:
             item["source_plan_id"] = r["source_plan_id"]
+        if "batch_id" in r.keys() and r["batch_id"]:
+            item["batch_id"] = r["batch_id"]
         out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------- 批次联合排课
+
+def _app_to_kwargs(app):
+    """BatchApplicationIn -> batch_planner 使用的申请字典。"""
+    data = app.model_dump()
+    return {
+        "application_id": data["application_id"],
+        "completed_courses": data["completed_courses"],
+        "target_courses": data["target_courses"],
+        "start_semester": data["start_semester"],
+        "max_credits_per_semester": data["max_credits_per_semester"],
+        "num_semesters": data["num_semesters"],
+        "locked": data.get("locked") or [],
+        "unavailable_semesters": data.get("unavailable_semesters") or [],
+    }
+
+
+def _member_request_data(app_kwargs):
+    """成员课表落库的 request（沿用普通规划结构，去掉申请标识；空键省略锁定字段）。"""
+    req = {
+        "completed_courses": app_kwargs["completed_courses"],
+        "target_courses": app_kwargs["target_courses"],
+        "start_semester": app_kwargs["start_semester"],
+        "max_credits_per_semester": app_kwargs["max_credits_per_semester"],
+        "num_semesters": app_kwargs["num_semesters"],
+    }
+    if app_kwargs.get("locked"):
+        req["locked"] = app_kwargs["locked"]
+    if app_kwargs.get("unavailable_semesters"):
+        req["unavailable_semesters"] = app_kwargs["unavailable_semesters"]
+    return req
+
+
+@app.post("/plan-batches", status_code=201)
+def create_plan_batch(payload: BatchIn):
+    """一次提交多份普通课表申请，在同一当前目录与席位余量快照上联合排课。
+
+    - 每份申请携带唯一非空申请标识及与 ``POST /plans`` 相同的规划输入；
+      标识重复或任一申请参数非法时整批拒绝（422）且不保存。
+    - 实际修读课程同一学期的批次席位总需求不得超额：先最大化获得完整课表的申请数，
+      再按申请标识升序比较完成学期（未入选晚于任何完成学期），最后按申请标识升序
+      比较入选课表逐学期课程代码序列，确定唯一结果。
+    - 待确认结果不预占席位；至少一份可排即保存为待确认批次（未入选申请给出原因）。
+      无一可排时返回 422 NO_SOLUTION 且不保存批次。
+    """
+    applications = [_app_to_kwargs(a) for a in payload.applications]
+    app_by_id = {a["application_id"]: a for a in applications}
+    with db.session() as conn:
+        version = db.get_current_version(conn)
+        catalog = _to_catalog(db.load_courses(conn, version["id"]))
+        equiv_groups = db.load_equiv_groups(conn, version["id"])
+        seat_caps = db.load_seat_caps(conn)
+        occupied = db.seat_occupied_map(conn)
+        try:
+            batch_result = build_batch(
+                catalog, applications,
+                equiv_groups=equiv_groups, seat_caps=seat_caps, occupied=occupied)
+        except PlanError as exc:
+            status = 400 if exc.code == "INVALID_INPUT" else 422
+            raise HTTPException(status_code=status,
+                                detail={"code": exc.code, "message": exc.message})
+
+        members = []
+        selected_count = 0
+        for app_id in batch_result["order"]:
+            res = batch_result["results"][app_id]
+            app_kwargs = app_by_id[app_id]
+            if res["option"] is not None:
+                selected_count += 1
+                prepared = res["prepared"]
+                if res["trivial"]:
+                    schedule = {
+                        "completion_semester": None,
+                        "total_credits": 0,
+                        "semesters": [],
+                        "message": "目标课程均已完成，无需排课",
+                    }
+                else:
+                    schedule = format_schedule(
+                        catalog, prepared["start_year"], prepared["start_season"],
+                        res["option"].k, res["option"].seq)
+                members.append({
+                    "application_id": app_id,
+                    "selected": True,
+                    "plan_id": None,  # 落库后回填
+                    "request": _member_request_data(app_kwargs),
+                    "result": schedule,
+                })
+            else:
+                code, message = res["error"]
+                members.append({
+                    "application_id": app_id,
+                    "selected": False,
+                    "reason_code": code,
+                    "reason": message,
+                    "request": _member_request_data(app_kwargs),
+                })
+
+        if selected_count == 0:
+            # 无一可排：说明无解且不保存批次
+            raise HTTPException(status_code=422, detail={
+                "code": "NO_SOLUTION",
+                "message": "批次内无一申请可排出完整课表，无解，批次未保存",
+                "applications": [
+                    {"application_id": m["application_id"],
+                     "reason_code": m["reason_code"], "reason": m["reason"]}
+                    for m in members],
+            })
+
+        # 落库前复查：目录在计算期间被修订则拒绝旧版本结果（409，不保存）
+        current = db.get_current_version(conn)
+        if current["id"] != version["id"]:
+            raise HTTPException(status_code=409, detail={
+                "code": "CATALOG_CHANGED",
+                "message": f"目录在批量规划期间已修订（计算基于版本 {version['id']}，"
+                           f"当前版本 {current['id']}），旧版本结果被拒绝，请重新发起",
+            })
+
+        batch_id = uuid.uuid4().hex[:12]
+        plan_rows = []
+        for member in members:
+            if not member["selected"]:
+                continue
+            plan_id = uuid.uuid4().hex[:12]
+            member["plan_id"] = plan_id
+            plan_rows.append((plan_id, member["request"], member["result"]))
+        # 先建批次，再挂成员课表（同一事务，异常整体回滚）
+        db.insert_plan_batch(conn, batch_id, version["id"],
+                             {"applications": applications}, members)
+        for plan_id, request_data, schedule in plan_rows:
+            db.insert_plan(conn, plan_id, version["id"], request_data, schedule,
+                           batch_id=batch_id)
+        saved = db.get_plan_batch(conn, batch_id)
+    return _batch_out(saved)
+
+
+@app.get("/plan-batches")
+def list_plan_batches():
+    """批次列表（最近创建在前）。"""
+    with db.session() as conn:
+        rows = db.list_plan_batches(conn)
+    return {"batches": [
+        {"batch_id": r["id"], "status": r["status"], "catalog_version": r["version_id"],
+         "created_at": r["created_at"],
+         "selected": sum(1 for m in json.loads(r["members_json"]) if m["selected"]),
+         "total": len(json.loads(r["members_json"]))}
+        for r in rows]}
+
+
+@app.get("/plan-batches/{batch_id}")
+def get_plan_batch(batch_id: str):
+    """回看批次：逐申请的完整课表或未入选原因（含绑定目录版本与确认状态）。"""
+    with db.session() as conn:
+        row = db.get_plan_batch(conn, batch_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"批次 {batch_id} 不存在"})
+    return _batch_out(row)
+
+
+def _batch_out(row):
+    members = json.loads(row["members_json"])
+    return {
+        "batch_id": row["id"],
+        "status": row["status"],
+        "catalog_version": row["version_id"],
+        "created_at": row["created_at"],
+        "selected_count": sum(1 for m in members if m["selected"]),
+        "total_applications": len(members),
+        "applications": members,
+    }
+
+
+@app.post("/plan-batches/{batch_id}/confirm")
+def confirm_plan_batch(batch_id: str):
+    """确认整个批次：单事务内原子复核目录版本与整批席位，成功则一并占位。
+
+    - 重复确认幂等（已确认直接返回，不重复占位）；
+    - 目录自批次生成后修订 -> 409 CATALOG_CHANGED，整批拒绝、原占位不变；
+    - 任一入选课表席位不足 -> 409 SEAT_CONFLICT，整笔事务回滚，原占位不变、不超卖。
+    """
+    with db.transaction() as conn:
+        batch = db.get_plan_batch(conn, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"批次 {batch_id} 不存在"})
+        if batch["status"] == "confirmed":
+            return _batch_out(batch)  # 幂等：不重复占位
+
+        current = db.get_current_version(conn)
+        if batch["version_id"] != current["id"]:
+            raise HTTPException(status_code=409, detail={
+                "code": "CATALOG_CHANGED",
+                "message": f"目录已修订（当前版本 {current['id']}，批次基于版本 "
+                           f"{batch['version_id']}），整批确认被拒绝、原占位不变，"
+                           "请重新发起批量规划",
+            })
+
+        members = json.loads(batch["members_json"])
+        plan_ids = {m["plan_id"] for m in members if m["selected"]}
+        plans = {r["id"]: r for r in db.list_plans_by_batch(conn, batch_id)}
+        if set(plans) != plan_ids:  # 防御：成员课表缺失属外部破坏
+            raise HTTPException(status_code=409, detail={
+                "code": "BATCH_BROKEN",
+                "message": "批次成员课表不完整，确认被拒绝（数据可能被外部修改）"})
+
+        # 整批席位复核：把全部入选课表的实际修读需求合并计数
+        needs = {}
+        for plan_id in plans:
+            for code, semester in _placements_from_result(
+                    json.loads(plans[plan_id]["result_json"])):
+                needs[(code, semester)] = needs.get((code, semester), 0) + 1
+        occupied = db.seat_occupied_map(conn)
+        caps = db.load_seat_caps(conn)
+        conflicts = []
+        for (code, semester), need in sorted(needs.items()):
+            cap = caps.get((code, semester))
+            if cap is None:
+                continue
+            occ = occupied.get((code, semester), 0)
+            if occ + need > cap:
+                conflicts.append((code, semester, cap, occ, need))
+        if conflicts:
+            raise HTTPException(status_code=409, detail={
+                "code": "SEAT_CONFLICT",
+                "message": "确认时整批席位余量不足，整批确认被拒绝、原占位不变："
+                           + "；".join(
+                               f"{code}@{semester}（批次需 {need}，上限 {cap}，"
+                               f"已占用 {occ}，余量 {cap - occ}）"
+                               for code, semester, cap, occ, need in conflicts),
+                "conflicts": [
+                    {"course_code": code, "semester": semester,
+                     "cap": cap, "occupied": occ, "requested": need,
+                     "remaining": cap - occ}
+                    for code, semester, cap, occ, need in conflicts],
+            })
+
+        for plan_id, row_plan in plans.items():
+            db.insert_holds(conn, plan_id,
+                            _placements_from_result(json.loads(row_plan["result_json"])))
+            db.set_plan_status(conn, plan_id, "confirmed")
+        db.set_plan_batch_status(conn, batch_id, "confirmed")
+        out = _batch_out(db.get_plan_batch(conn, batch_id))
     return out
 
 
@@ -589,6 +840,15 @@ def confirm_plan(plan_id: str):
                 "code": "NOT_FOUND", "message": f"方案 {plan_id} 不存在"})
         if row["status"] == "confirmed":
             return _plan_out(row)  # 幂等：已确认直接返回，不重复占位
+
+        # 批次成员课表不得单独确认：必须经 /plan-batches/{id}/confirm 整批原子占位，
+        # 杜绝“一份一份确认”造成的部分占位与整批语义破坏
+        if "batch_id" in row.keys() and row["batch_id"]:
+            raise HTTPException(status_code=409, detail={
+                "code": "BATCH_CONFIRM_REQUIRED",
+                "message": f"方案 {plan_id} 属于批次 {row['batch_id']}，不得单独确认；"
+                           "请使用 POST /plan-batches/"
+                           f"{row['batch_id']}/confirm 整批确认"})
 
         current = db.get_current_version(conn)
         if row["version_id"] != current["id"]:

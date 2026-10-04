@@ -120,6 +120,39 @@ class PlanIn(BaseModel):
         return codes
 
 
+class BatchApplicationIn(PlanIn):
+    """批次内的一份普通课表申请：在普通规划输入之上携带唯一非空申请标识。"""
+
+    application_id: str = Field(min_length=1, max_length=64, description="唯一非空申请标识")
+
+    @field_validator("application_id")
+    @classmethod
+    def norm_app_id(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("申请标识不能为空")
+        return v
+
+
+class BatchIn(BaseModel):
+    """一次批量提交：多份普通课表申请，在同一目录与席位余量快照上联合排课。
+
+    - 申请标识必须非空且批次内唯一（重复或为空整批拒绝、不保存）；
+    - 每份申请的参数规则与 POST /plans 完全一致（任一非法整批拒绝）。
+    """
+
+    applications: list[BatchApplicationIn] = Field(
+        min_length=1, description="批量课表申请（申请标识非空且批次内唯一）")
+
+    @model_validator(mode="after")
+    def unique_application_ids(self):
+        ids = [a.application_id for a in self.applications]
+        dupes = sorted({x for x in ids if ids.count(x) > 1})
+        if dupes:
+            raise ValueError(f"申请标识重复：{'、'.join(dupes)}")
+        return self
+
+
 class SeatCapIn(BaseModel):
     """按课程代码与学期设置席位上限；非负整数，未设置即不限额。"""
 

@@ -83,8 +83,51 @@
   - 审核只依赖绑定目录版本的学分与互认组，是**快照**：后续目录或要求修订不改变历史审核；
     未知已修课程拒绝（422）且不留记录。
   - 现有规划、滚动重排、确认与席位行为保持兼容，不受影响。
+- **批次联合排课（本轮新增）**：教务处一次提交**多份普通课表申请**，每份带**唯一非空
+  申请标识**及与单份规划完全相同的输入，批次在**同一当前目录与席位余量快照**上联合排课：
+  - 实际修读课程在**同一学期**的**批次席位总需求**不得超额（不预占席位，仅联合求解）。
+  - 确定性结果依次按：① **最大化获得完整课表的申请数**；② 按申请标识升序比较
+    **完成学期**（未入选视为晚于任何完成学期）；③ 按申请标识升序比较入选课表
+    **逐学期课程代码序列**（未入选视为最末）确定唯一解。
+  - 返回各申请的完整课表（成员 `plan_id`，可按现有方案回看）或**未入选原因**
+    （独立无解给出 `NO_SOLUTION` 等原因；可独立排课但联合席位不足给出 `BATCH_CAPACITY`
+    与超额课程学期）。**至少一份可排**才保存为待确认批次；**无一可排**返回 422
+    `NO_SOLUTION` 且**不保存批次**。
+  - 结果**待确认、不预占席位**；`POST /plan-batches/{id}/confirm` 在**单事务**
+    （立即加写锁）内复核**目录版本**与**整批席位**（全部入选课表需求合并计数），
+    成功则**一并占位**并把成员课表置为已确认；目录版本变化或整批余量不足则**整批
+    拒绝、原占位不变、绝不超卖**；重复确认**幂等**。
+  - 批次成员课表**不得单独确认**（409 `BATCH_CONFIRM_REQUIRED`），必须整批确认；
+    但仍可用现有 `GET /plans/{id}` 回看。**标识重复或任一申请参数非法（含未知课程、
+    学期格式错误等）时整批拒绝（422/400）且不保存**。
+  - 现有单份规划、确认、回看、滚动重排、审核与启动方式**完全保持兼容**。
 
-## 本轮新增（培养方案达成课表的执行中途重排）
+## 本轮新增（多份普通课表申请的批次联合排课）
+
+- 新增 **批次申请** `POST /plan-batches`：一次提交多份**普通课表申请**，每份携带
+  **唯一非空申请标识**（`application_id`）与单份规划的全部输入（已修、目标、起始学期、
+  学分上限、学期数，可选锁定/不可排课学期）。批次在**同一当前目录版本与当时席位余量
+  快照**上联合排课。
+- **批次席位总需求约束**：实际修读课程在**同一学期**的批次总需求不得超过席位余量；
+  待确认批次**不预占席位**。各申请仍独立满足开课季节、先修组、同修、互认、锁定、
+  不可排课学期与学分上限。
+- **唯一结果的三级目标**：① 最大化获得完整课表的申请数；② 按申请标识升序比较
+  **完成学期**（未入选晚于任何完成学期）；③ 按申请标识升序比较**入选课表逐学期课程
+  代码序列**（每学期代码升序、再按学期先后；未入选视为最末）。
+- **返回与保存**：逐申请返回完整课表（成员 `plan_id`，可 `GET /plans/{id}` 回看）或
+  未入选原因（`reason_code` + 说明）。**至少一份可排**才保存待确认批次；**无一可排**
+  返回 422 `NO_SOLUTION`、**不保存批次**。
+- **整批确认**：`POST /plan-batches/{batch_id}/confirm` 在**单事务**（立即加写锁）内
+  复核目录版本与整批席位（入选课表需求合并计数），成功**一并占位**；目录修订
+  409 `CATALOG_CHANGED`、整批余量不足 409 `SEAT_CONFLICT`，均**整批拒绝、原占位不变、
+  不超卖**；重复确认幂等。成员课表单独确认返回 409 `BATCH_CONFIRM_REQUIRED`。
+- **整批拒绝**：标识重复/为空、申请数超限、任一申请参数非法（空目标、非正上限/学期数、
+  非法学期、未知课程、重复锁定等）时整批拒绝（422/400）且**不保存**。
+- 新增 `GET /plan-batches`（批次列表）与 `GET /plan-batches/{id}`（回看批次）；
+  现有单份规划、确认、回看、重排、审核与席位接口、启动方式全部**保持兼容**。
+  用法见下文「批次联合排课」。
+
+## 上一轮新增（培养方案达成课表的执行中途重排）
 
 - **同一接口支持两类来源**：`POST /plans/{id}/replan` 现可对**已确认的培养方案达成课表**
   发起执行中途重排（普通规划重排行为不变）。凭**来源方案编号、已结束学期数、累计已修
@@ -106,7 +149,7 @@
   `NO_SOLUTION`（席位原因说明已满课程学期）。普通规划、重排与审核接口保持兼容，启动
   方式不变。用法见下文「执行中途滚动重排」。
 
-## 上一轮新增（培养方案达成课表）
+## 更早一轮新增（培养方案达成课表，可发起执行中途重排）
 
 - 新增 **达成课表申请**：`POST /requirement-versions/{rv_id}/plans`，学生凭要求版本、
   累计已修课程、起始学期、每学期学分上限与规划学期数，求期限内最早达成全部必修与
@@ -184,6 +227,10 @@ Compose 通过命名卷 `planner-data` 持久化数据。
 | GET | `/plans/{id}` | 回看方案（含绑定的目录版本号） |
 | POST | `/plans/{id}/confirm` | 确认方案/草案：事务内原子复核目录版本与每门课席位并占位；失败 409 回滚不超卖 |
 | POST | `/plans/{id}/replan` | 已确认方案（普通规划或培养方案达成课表）执行中途滚动重排，生成关联草案（201，不占位） |
+| POST | `/plan-batches` | 一次提交多份普通课表申请（唯一非空标识+规划输入），同目录与余量快照联合排课（201；无一可排 422 不保存） |
+| GET | `/plan-batches` | 批次列表 |
+| GET | `/plan-batches/{id}` | 回看批次（逐申请完整课表或未入选原因、绑定目录版本、确认状态） |
+| POST | `/plan-batches/{id}/confirm` | 整批确认：单事务原子复核目录版本与整批席位并一并占位；失败 409 整批拒绝、原占位不变；重复确认幂等 |
 | POST | `/programs/{program_code}/requirement-versions` | 登记培养方案要求版本（绑定既有目录版本；编号内版本号自增） |
 | GET | `/programs/requirement-versions` | 列出全部培养方案的要求版本 |
 | GET | `/programs/{program_code}/requirement-versions` | 列出某培养方案编号的全部要求版本 |
@@ -869,6 +916,113 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 
 **互认按实际修读课程占位**：择修替代课 CS402 时只占 CS402 的名额，CS401 名额不被占用。
 
+### 批次联合排课（本轮新增）
+
+教务处一次提交多份**普通课表申请**。每份申请携带唯一非空 `application_id` 与单份规划
+`POST /plans` 的全部字段（含可选 `locked`、`unavailable_semesters`）；批次在**同一当前
+目录版本与当时席位余量快照**上联合求解。三级确定性目标依次为：
+
+1. **最大化获得完整课表的申请数**；
+2. 再按申请标识升序比较**完成学期**（未入选视为晚于任何完成学期）；
+3. 再按申请标识升序比较**入选课表逐学期课程代码序列**（学期内代码升序、再按学期先后；
+   未入选视为最末）。
+
+提交（注意：即使部分申请独立无解，只要至少一份可排就返回 201，并在响应中给出未入选
+申请的原因；全部都不可排才 422 且不保存）：
+
+```bash
+curl -X POST http://localhost:8000/plan-batches \
+  -H 'Content-Type: application/json' -d '{
+    "applications": [
+      {"application_id": "app-2026-001",
+       "completed_courses": [], "target_courses": ["CS401"],
+       "start_semester": "2026-SPRING",
+       "max_credits_per_semester": 12, "num_semesters": 6},
+      {"application_id": "app-2026-002",
+       "completed_courses": [], "target_courses": ["CS401"],
+       "start_semester": "2026-SPRING",
+       "max_credits_per_semester": 12, "num_semesters": 6}
+    ]
+  }'
+```
+
+响应（201，节选）——逐申请按标识升序给出结果。下例中 CS401 在 2027-FALL 仅 1 个名额，
+两份申请联合排课后 **app-001 占 2027-FALL、app-002 顺延 2028-FALL，均获得完整课表**：
+
+```json
+{
+  "batch_id": "ab2e1b7811b6",
+  "status": "proposed",
+  "catalog_version": 1,
+  "selected_count": 2,
+  "total_applications": 2,
+  "applications": [
+    {"application_id": "app-2026-001", "selected": true, "plan_id": "fc05c4d25f3b",
+     "request": {"target_courses": ["CS401"], "...": "..."},
+     "result": {"completion_semester": "2027-FALL",
+                "semesters": [ {"semester": "2026-SPRING", "courses": [{"code": "CS101", "...": "..."}]}], "...": "..."}},
+    {"application_id": "app-2026-002", "selected": true, "plan_id": "92e8ee428f13",
+     "result": {"completion_semester": "2028-FALL", "...": "..."}}
+  ]
+}
+```
+
+未入选申请示例（名额封死、6 学期内只有一份能完整时，标识较大者未入选）：
+
+```json
+{"application_id": "app-2026-002", "selected": false,
+ "reason_code": "BATCH_CAPACITY",
+ "reason": "申请虽可独立排出完整课表，但批次内同课程同学期席位总量不足，未入选（已优先保证完整课表申请数最大化）：CS401@2027-FALL（批次总需求 2，上限 1）"}
+```
+
+- **独立无解**的申请其 `reason_code` 为该申请自身原因（`NO_SOLUTION`、
+  `REQUIREMENT_CONFLICT` 等），不占用批次席位，也不影响其他申请；
+  **参数非法/引用未知课程/标识重复**则不属于逐申请结果，而是**整批拒绝**（422/400）。
+- **空课表**（目标均已完成）视为完整方案，直接入选且不占席位，
+  `completion_semester` 为 `null`、`semesters` 为 `[]`。
+
+整批确认（单事务原子复核目录版本与**整批席位**——全部入选课表的实际修读需求合并计数，
+成功一并占位；**待确认批次不预占席位**）：
+
+```bash
+curl -X POST http://localhost:8000/plan-batches/<batch_id>/confirm
+```
+
+```json
+{"batch_id": "ab2e1b7811b6", "status": "confirmed",
+ "catalog_version": 1, "selected_count": 2, "applications": [ {"selected": true, "...": "..."}]}
+```
+
+- 目录在批次生成后修订 -> 409 `CATALOG_CHANGED`；任一入选课表席位余量不足
+  -> 409 `SEAT_CONFLICT`（`conflicts` 给出 `requested` 为**整批合并需求**、
+  `remaining` 为确认时余量）。两者都**整批回滚、原占位不变、绝不超卖**。
+- 重复确认**幂等**：已确认批次再次确认直接返回，不重复占位。
+- 成员课表（`plan_id`）可 `GET /plans/{id}` 按现有方式回看，确认后随批次一并成为
+  `confirmed` 并写入席位占位；但**不得**用 `POST /plans/{id}/confirm` 单独确认
+  （409 `BATCH_CONFIRM_REQUIRED`），避免部分占位破坏整批语义。
+
+回看与列表：
+
+```bash
+curl http://localhost:8000/plan-batches                       # 批次列表
+curl http://localhost:8000/plan-batches/<batch_id>           # 批次详情（含未入选原因）
+curl http://localhost:8000/plans/<member_plan_id>            # 成员课表按现有方式回看
+```
+
+整批拒绝与无解（均不保存批次）：
+
+```bash
+# 申请标识重复 -> 422 INVALID_INPUT（整批拒绝、不保存）
+# 任一申请空目标 / 非正学分上限 / 非法学期 / 未知课程 -> 422 或 400（整批拒绝、不保存）
+# 全部申请都不可排 -> 422 NO_SOLUTION，detail.applications 给出每份的具体原因，不保存批次
+```
+
+可运行示例脚本：
+
+```bash
+bash examples/batch_demo.sh
+```
+
 ### 错误响应
 
 失败时返回相应 HTTP 状态码与原因，不返回部分课表：
@@ -890,6 +1044,9 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 | `CAP_BELOW_OCCUPIED` | 409 | 席位上限低于该 (课程,学期) 当前已占用席位，拒绝设置，原上限不变 |
 | `SEAT_CONFLICT` | 409 | 确认时原子复核席位发现余量不足，拒绝确认、事务回滚、原方案与原占位保留（不超卖） |
 | `DRAFT_EXPIRED` | 409 | 重排草案过期：来源方案不存在/未确认，或同一来源已有生效重排结果 |
+| `BATCH_CAPACITY` | 201 内联 | 批次中某申请可独立排出完整课表，但联合席位总量不足，在最大化完整课表数后排他未入选（成员 `reason_code`，附超额课程学期/上限/批次总需求；非顶层错误） |
+| `BATCH_CONFIRM_REQUIRED` | 409 | 批次成员课表不得单独确认，须经 `POST /plan-batches/{id}/confirm` 整批确认 |
+| `BATCH_BROKEN` | 409 | 批次成员课表不完整（数据被外部修改），拒绝确认 |
 | `NOT_FOUND` | 404 | 方案、目录版本、要求版本或审核不存在；要求版本绑定的目录版本不存在 |
 | `TOO_COMPLEX` | 422 | 达成审核的归属组合（或排课搜索）超出内置复杂度上限 |
 
@@ -898,15 +1055,16 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 ```
 app/
   main.py       # FastAPI 路由与错误处理
-  planner.py    # 规划引擎（先修组枚举、互认替代、同修合并、锁定/不可排课/席位余量约束、回溯排课、字典序选优）
+  planner.py    # 规划引擎（先修组枚举、互认替代、同修合并、锁定/不可排课/席位余量约束、回溯排课、字典序选优、全部可行课表枚举）
+  batch_planner.py # 批次联合排课（逐申请可行课表枚举去重、最大化完整数+完成学期+课表序列三级决胜、批次席位总需求约束）
   replan.py     # 执行中途滚动重排（学期顺延、剩余学期课程差异、席位余量透传）
   audit.py      # 达成审核引擎（必修优先、互认去重、选修组优先级学分最大化、归属序列字典序决胜）
   program_plan.py # 培养方案达成课表（绑定目录管互认/计入学分、当前目录管开课/先修/席位；枚举可达成选课集合后复用排课与审核）
   schemas.py    # 请求模型与校验（含互认组、席位上限、培养方案要求版本、达成审核与达成课表校验）
-  db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案、席位 seat_caps/seat_holds、要求版本 requirement_versions、审核 audits；方案 attribution_json 存预计归属）
+  db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案、席位 seat_caps/seat_holds、要求版本 requirement_versions、审核 audits、批次 plan_batches；方案 attribution_json 存预计归属、batch_id 关联批次）
   seed_data.py  # 种子课程目录（版本 1）
-tests/          # pytest 单元与 API 集成测试（含课程互认组、席位上限/余量/原子确认/重排占位替换、达成审核、培养方案达成课表与两版目录分工测试）
-examples/       # demo.sh 调用示例、catalog_v2.json 目录修订示例、catalog_v3_equiv.json 互认组修订示例、requirement_cs_2024.json 要求版本示例
+tests/          # pytest 单元与 API 集成测试（含课程互认组、席位上限/余量/原子确认/重排占位替换、达成审核、培养方案达成课表与两版目录分工、批次联合排课测试）
+examples/       # demo.sh 调用示例、batch_demo.sh 批次联合排课示例、catalog_v2.json 目录修订示例、catalog_v3_equiv.json 互认组修订示例、requirement_cs_2024.json 要求版本示例
 Dockerfile / docker-compose.yml
 ```
 

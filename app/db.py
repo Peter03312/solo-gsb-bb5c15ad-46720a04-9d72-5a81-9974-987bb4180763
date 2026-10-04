@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS plans (
     created_at TEXT NOT NULL,
     source_plan_id TEXT REFERENCES plans(id), -- 滚动重排草案关联的原方案；非草案为 NULL
     replan_json TEXT,                         -- 草案的重排上下文与差异；非草案为 NULL
-    attribution_json TEXT                     -- 培养方案达成课表的预计归属；普通规划为 NULL
+    attribution_json TEXT,                    -- 培养方案达成课表的预计归属；普通规划为 NULL
+    batch_id TEXT REFERENCES plan_batches(id) -- 批次成员课表；非成员为 NULL
 );
 CREATE TABLE IF NOT EXISTS equiv_groups (
     version_id INTEGER NOT NULL REFERENCES catalog_versions(id),
@@ -83,6 +84,17 @@ CREATE TABLE IF NOT EXISTS audits (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audits_requirement ON audits(requirement_version_id);
+-- 批次联合排课：一次提交多份普通课表申请，联合排课结果作为一个批次整体待确认。
+-- 批次绑定提交时的目录版本与余量快照；members_json 保存逐申请结果（含未入选原因）。
+-- 确认须整批原子复核目录版本与席位并占位；重复确认幂等；任一复核失败整批拒绝。
+CREATE TABLE IF NOT EXISTS plan_batches (
+    id TEXT PRIMARY KEY,
+    version_id INTEGER NOT NULL REFERENCES catalog_versions(id),
+    request_json TEXT NOT NULL,    -- 原始申请（标识 + 各份规划输入）
+    members_json TEXT NOT NULL,    -- 逐申请结果快照（plan_id/课表/未入选原因，按标识升序）
+    status TEXT NOT NULL DEFAULT 'proposed',  -- proposed / confirmed
+    created_at TEXT NOT NULL
+);
 """
 
 # 既有数据库增量升级（SQLite 不支持 CREATE TABLE IF NOT EXISTS 加列）
@@ -90,6 +102,7 @@ MIGRATIONS = (
     "ALTER TABLE plans ADD COLUMN source_plan_id TEXT REFERENCES plans(id)",
     "ALTER TABLE plans ADD COLUMN replan_json TEXT",
     "ALTER TABLE plans ADD COLUMN attribution_json TEXT",
+    "ALTER TABLE plans ADD COLUMN batch_id TEXT REFERENCES plan_batches(id)",
 )
 
 
@@ -212,14 +225,57 @@ def load_equiv_groups(conn, version_id):
     return [groups[k] for k in sorted(groups)]
 
 
-def insert_plan(conn, plan_id, version_id, request, result, attribution=None):
+def insert_plan(conn, plan_id, version_id, request, result, attribution=None, batch_id=None):
     conn.execute(
         "INSERT INTO plans (id, version_id, request_json, result_json, status, created_at,"
-        " attribution_json) VALUES (?,?,?,?,?,?,?)",
+        " attribution_json, batch_id) VALUES (?,?,?,?,?,?,?,?)",
         (plan_id, version_id, json.dumps(request, ensure_ascii=False),
          json.dumps(result, ensure_ascii=False), "proposed", _now(),
-         json.dumps(attribution, ensure_ascii=False) if attribution is not None else None),
+         json.dumps(attribution, ensure_ascii=False) if attribution is not None else None,
+         batch_id),
     )
+
+
+# ---------------------------------------------------------------- 批次联合排课
+
+def insert_plan_batch(conn, batch_id, version_id, request, members):
+    """登记一个待确认批次；members 为逐申请结果快照（list[dict]），整体原子写入。"""
+    conn.execute(
+        "INSERT INTO plan_batches (id, version_id, request_json, members_json, status,"
+        " created_at) VALUES (?,?,?,?,?,?)",
+        (batch_id, version_id,
+         json.dumps(request, ensure_ascii=False),
+         json.dumps(members, ensure_ascii=False), "proposed", _now()),
+    )
+
+
+def get_plan_batch(conn, batch_id):
+    return conn.execute("SELECT * FROM plan_batches WHERE id=?", (batch_id,)).fetchone()
+
+
+def list_plan_batches(conn):
+    return conn.execute(
+        "SELECT * FROM plan_batches ORDER BY created_at DESC, id DESC").fetchall()
+
+
+def set_plan_batch_status(conn, batch_id, status):
+    conn.execute("UPDATE plan_batches SET status=? WHERE id=?", (status, batch_id))
+
+
+def list_plans_by_batch(conn, batch_id):
+    """批次成员课表（插入顺序即申请标识升序）。"""
+    return conn.execute(
+        "SELECT * FROM plans WHERE batch_id=? ORDER BY rowid", (batch_id,)).fetchall()
+
+
+def plan_batch_out(row):
+    return {
+        "batch_id": row["id"],
+        "status": row["status"],
+        "catalog_version": row["version_id"],
+        "created_at": row["created_at"],
+        "members": json.loads(row["members_json"]),
+    }
 
 
 def insert_draft(conn, plan_id, version_id, request, result, source_plan_id, replan,

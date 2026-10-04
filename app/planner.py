@@ -28,6 +28,7 @@ SEMESTER_RE = re.compile(r"^(\d{4})-(SPRING|FALL)$")
 
 LEAF_CAP = 512         # 先修选课组合数上限，防止指数爆炸
 NODE_BUDGET = 200_000  # 单个候选课程集合的排课搜索节点上限
+ENUM_NODE_BUDGET = 400_000  # 批量排课：单份申请枚举全部可行课表的搜索节点上限
 
 
 class PlanError(Exception):
@@ -537,6 +538,124 @@ def schedule_course_set(catalog, courses, *, completed, equiv, lock_items=(),
     return None, ("conflict", note)
 
 
+def enumerate_schedules_for_course_set(catalog, courses, *, completed, equiv, lock_items=(),
+                                       unavailable_idx=frozenset(), start_year, start_season,
+                                       max_credits, num_semesters, seat_caps, occupied, counter):
+    """枚举一个候选课程集合在期限内的全部可行排课，按 (k, seq) 升序产出。
+
+    与 schedule_course_set 使用完全相同的块化、先修/同修/锁定/不可排课/席位约束，
+    但不做“最早 + 字典序”截断，而是返回全部可行的 (k, seq)（同一课程集合的每个
+    分配至多出现一次），供批量联合排课在席位竞争下挑选。
+
+    counter: [int] 跨课程集合共享的搜索节点计数；超过 ENUM_NODE_BUDGET 抛 TOO_COMPLEX。
+    返回 (schedules, None) 或 ([], (kind, message))（kind 同 schedule_course_set）。
+    """
+    seat_caps = seat_caps or {}
+    occupied = occupied or {}
+    try:
+        blocks = _build_blocks(catalog, courses)
+    except PlanError as exc:
+        return [], ("conflict", exc.message)
+    reqs = _block_requirements(catalog, completed, blocks, equiv)
+    if reqs is None:
+        return [], ("conflict", "先修条件无法满足，条件冲突")
+    try:
+        fixed = _fixed_assignments(blocks, lock_items, start_season)
+    except PlanError as exc:
+        return [], ("conflict", exc.message)
+    heavy = next((b for b in blocks if b.credits > max_credits), None)
+    if heavy is not None:
+        return [], ("no_solution",
+                    f"同修课程 {'+'.join(heavy.codes)} 学分合计 {heavy.credits} "
+                    f"超过每学期学分上限 {max_credits}")
+
+    n = len(blocks)
+    assign = [-1] * n
+
+    def remaining_seat(block_code, idx):
+        label = semester_label(start_year, start_season, idx)
+        limit = seat_caps.get((block_code, label))
+        if limit is None:
+            return None
+        return limit - occupied.get((block_code, label), 0)
+
+    def dfs(i, k, remaining, found):
+        counter[0] += 1
+        if counter[0] > ENUM_NODE_BUDGET:
+            raise PlanError("TOO_COMPLEX", "批量排课的可行课表枚举超出复杂度限制")
+        if not remaining:
+            # 只在“最后一个学期 k 确实排了课”时记录：提前完成的同一分配会在更小期限
+            # 被枚举，这里记录会重复并把完成学期误标为更晚的空学期。
+            if max(assign) == k:
+                seq = tuple(
+                    tuple(sorted(c for b in range(n) if assign[b] == j for c in blocks[b].codes))
+                    for j in range(1, k + 1))
+                found.append((k, seq))
+            return
+        if i > k:
+            return
+        for b in remaining:
+            f = fixed.get(b)
+            if f is not None and f < i:
+                return
+        for b in remaining:
+            f = fixed.get(b)
+            windows = [f] if f is not None else range(i, k + 1)
+            if not any(
+                season_at(start_season, j) in blocks[b].seasons
+                and j not in unavailable_idx
+                and all((r := remaining_seat(c, j)) is None or r >= 1
+                        for c in blocks[b].codes)
+                for j in windows
+            ):
+                return
+        for s in SEASONS:
+            fixed_season = sum(blocks[b].credits for b in remaining
+                               if blocks[b].seasons == frozenset({s}))
+            slots = sum(1 for j in range(i, k + 1)
+                        if season_at(start_season, j) == s and j not in unavailable_idx)
+            if fixed_season > max_credits * slots:
+                return
+        if i in unavailable_idx:
+            dfs(i + 1, k, remaining, found)
+            return
+        must = frozenset(b for b in remaining if fixed.get(b) == i)
+        avail = [
+            b for b in remaining
+            if season_at(start_season, i) in blocks[b].seasons
+            and fixed.get(b) in (None, i)
+            and all(any(0 < assign[o] < i for o in opts) for opts in reqs[b])
+            and all((r := remaining_seat(c, i)) is None or r >= 1
+                    for c in blocks[b].codes)
+        ]
+        if not must <= frozenset(avail):
+            return
+        optional = [b for b in avail if b not in must]
+        must_credits = sum(blocks[b].credits for b in must)
+        candidates = []
+        for r in range(len(optional) + 1):
+            for extra in combinations(optional, r):
+                if must_credits + sum(blocks[b].credits for b in extra) <= max_credits:
+                    combo = tuple(must) + extra
+                    key = tuple(sorted(c for b in combo for c in blocks[b].codes))
+                    candidates.append((key, combo))
+        candidates.sort(key=lambda x: x[0])
+        for _, combo in candidates:
+            for b in combo:
+                assign[b] = i
+            dfs(i + 1, k, remaining - frozenset(combo), found)
+            for b in combo:
+                assign[b] = -1
+
+    found = []
+    min_k = max(fixed.values(), default=1)
+    for k in range(min_k, num_semesters + 1):
+        for b in range(n):
+            assign[b] = -1
+        dfs(1, k, frozenset(range(n)), found)
+    return found, None
+
+
 def format_schedule(catalog, start_year, start_season, k, seq):
     """(k, seq) 排课结果 -> 对外的课表结构（学分取自所给目录版本）。"""
     semesters = []
@@ -558,32 +677,22 @@ def format_schedule(catalog, start_year, start_season, k, seq):
 
 # ---------------------------------------------------------------- 主入口
 
-def build_plan(catalog, completed, targets, start_semester, max_credits, num_semesters,
-               locked=None, unavailable=None, equiv_groups=None,
-               seat_caps=None, occupied=None):
-    """生成完整方案；失败抛出 PlanError（不返回部分课表）。
+def prepare_plan_inputs(catalog, completed, targets, start_semester, max_credits,
+                        num_semesters, locked=None, unavailable=None, equiv_groups=None,
+                        equiv=None):
+    """build_plan 的输入校验与准备阶段（批量排课复用同一份语义）。
 
-    catalog:     {code: Course}
-    completed:   已修课程代码集合
-    targets:     目标课程代码列表（非空）
-    locked:      可选锁定安排，(课程代码, 学期标签) 列表；锁定课程视为本次必修，
-                 必须安排在指定学期，且学期须在规划期限内
-    unavailable: 可选不可排课学期标签列表，这些学期不安排任何课程
-    equiv_groups: 可选课程互认组（随目录版本声明）；组内课程可替代满足目标课程
-                 与先修组选项，已修同组课程视为已满足；不豁免同修与锁定
-    seat_caps:   可选 {(课程代码, 学期标签): 非负上限}；缺省（无键）表示不限额。
-                 规划基于当时余量（上限 - occupied），余量为 0 的学期不得排入。
-    occupied:    可选 {(课程代码, 学期标签): 他方案已占用数}；不含本方案自身占位。
-                 滚动重排时调用方应剔除来源方案尚未结束学期的占位，避免与自身冲突。
+    返回 dict(start_year, start_season, completed, equiv, ..., lock_items,
+    unavailable_idx, leaves 相关)；调用方再传入席位上下文排课。
+    非法输入/课程缺失/条件冲突（枚举阶段）抛出与 build_plan 相同的 PlanError。
+    equiv 可直接传入已构建好的互认映射（批量排课多申请共享），否则由 equiv_groups 构建。
     """
     start_year, start_season = parse_semester(start_semester)
     targets = list(dict.fromkeys(t.strip().upper() for t in targets))
     completed = {c.strip().upper() for c in completed}
     locked = locked or []
     unavailable = unavailable or []
-    equiv = _equiv_map(equiv_groups)
-    seat_caps = seat_caps or {}
-    occupied = occupied or {}
+    equiv = equiv if equiv is not None else _equiv_map(equiv_groups)
 
     missing = [t for t in targets if t not in catalog]
     if missing:
@@ -634,6 +743,52 @@ def build_plan(catalog, completed, targets, start_semester, max_credits, num_sem
         target_reqs.add(req)
     target_reqs = sorted(target_reqs, key=lambda r: sorted(r))
     needed = locked_codes - completed
+    return {
+        "start_year": start_year,
+        "start_season": start_season,
+        "completed": completed,
+        "equiv": equiv,
+        "max_credits": max_credits,
+        "num_semesters": num_semesters,
+        "lock_items": lock_items,
+        "unavailable_idx": unavailable_idx,
+        "needed": needed,
+        "target_reqs": target_reqs,
+    }
+
+
+def build_plan(catalog, completed, targets, start_semester, max_credits, num_semesters,
+               locked=None, unavailable=None, equiv_groups=None,
+               seat_caps=None, occupied=None):
+    """生成完整方案；失败抛出 PlanError（不返回部分课表）。
+
+    catalog:     {code: Course}
+    completed:   已修课程代码集合
+    targets:     目标课程代码列表（非空）
+    locked:      可选锁定安排，(课程代码, 学期标签) 列表；锁定课程视为本次必修，
+                 必须安排在指定学期，且学期须在规划期限内
+    unavailable: 可选不可排课学期标签列表，这些学期不安排任何课程
+    equiv_groups: 可选课程互认组（随目录版本声明）；组内课程可替代满足目标课程
+                 与先修组选项，已修同组课程视为已满足；不豁免同修与锁定
+    seat_caps:   可选 {(课程代码, 学期标签): 非负上限}；缺省（无键）表示不限额。
+                 规划基于当时余量（上限 - occupied），余量为 0 的学期不得排入。
+    occupied:    可选 {(课程代码, 学期标签): 他方案已占用数}；不含本方案自身占位。
+                 滚动重排时调用方应剔除来源方案尚未结束学期的占位，避免与自身冲突。
+    """
+    seat_caps = seat_caps or {}
+    occupied = occupied or {}
+    prepared = prepare_plan_inputs(
+        catalog, completed, targets, start_semester, max_credits, num_semesters,
+        locked=locked, unavailable=unavailable, equiv_groups=equiv_groups)
+    start_year = prepared["start_year"]
+    start_season = prepared["start_season"]
+    completed = prepared["completed"]
+    equiv = prepared["equiv"]
+    lock_items = prepared["lock_items"]
+    unavailable_idx = frozenset(prepared["unavailable_idx"])
+    needed = prepared["needed"]
+    target_reqs = prepared["target_reqs"]
+
     if not needed and not target_reqs:
         return {
             "completion_semester": None,
