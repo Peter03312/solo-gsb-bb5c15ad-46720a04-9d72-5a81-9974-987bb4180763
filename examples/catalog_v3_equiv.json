@@ -1,0 +1,38 @@
+{
+  "note": "2026 互认修订：声明课程互认组（CS301/CS302、CS401/CS402 组内可替代满足目标与先修组）",
+  "courses": [
+    {"code": "MATH101", "name": "高等数学I", "credits": 4, "semesters": ["SPRING", "FALL"]},
+    {"code": "MATH102", "name": "高等数学II", "credits": 4, "semesters": ["SPRING", "FALL"],
+     "prereq_groups": [["MATH101"]]},
+    {"code": "MATH103", "name": "线性代数", "credits": 3, "semesters": ["SPRING", "FALL"]},
+    {"code": "CS101", "name": "程序设计基础", "credits": 3, "semesters": ["SPRING", "FALL"],
+     "coreqs": ["CS101L"]},
+    {"code": "CS101L", "name": "程序设计实验", "credits": 1, "semesters": ["SPRING", "FALL"]},
+    {"code": "CS201", "name": "数据结构", "credits": 3, "semesters": ["SPRING", "FALL"],
+     "prereq_groups": [["CS101"]]},
+    {"code": "CS202", "name": "离散数学", "credits": 3, "semesters": ["SPRING", "FALL"],
+     "prereq_groups": [["MATH101"]]},
+    {"code": "CS301", "name": "算法设计与分析", "credits": 3, "semesters": ["SPRING", "FALL"],
+     "prereq_groups": [["CS201", "CS202"], ["MATH103"]]},
+    {"code": "CS302", "name": "操作系统", "credits": 3, "semesters": ["FALL"],
+     "prereq_groups": [["CS201"]]},
+    {"code": "CS303", "name": "计算机网络", "credits": 3, "semesters": ["SPRING"],
+     "prereq_groups": [["CS201"]]},
+    {"code": "CS401", "name": "编译原理", "credits": 4, "semesters": ["FALL"],
+     "prereq_groups": [["CS301"]]},
+    {"code": "CS402", "name": "机器学习", "credits": 3, "semesters": ["SPRING"],
+     "prereq_groups": [["CS301"], ["MATH102"]]},
+    {"code": "CS403", "name": "云计算", "credits": 3, "semesters": ["SPRING", "FALL"],
+     "prereq_groups": [["CS302", "CS303"]]},
+    {"code": "PHYS201", "name": "大学物理", "credits": 3, "semesters": ["SPRING"],
+     "coreqs": ["PHYS201L"]},
+    {"code": "PHYS201L", "name": "物理实验", "credits": 1, "semesters": ["SPRING"]},
+    {"code": "CS999", "name": "专题研讨", "credits": 2, "semesters": ["SPRING"],
+     "coreqs": ["CS999L"]},
+    {"code": "CS999L", "name": "专题研讨实验", "credits": 2, "semesters": ["FALL"]}
+  ],
+  "equivalence_groups": [
+    ["CS301", "CS302"],
+    ["CS401", "CS402"]
+  ]
+}

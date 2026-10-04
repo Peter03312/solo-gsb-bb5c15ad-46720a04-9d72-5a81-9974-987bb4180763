@@ -1,0 +1,18 @@
+{
+  "program_code": "CS-BACH-2024",
+  "catalog_version_id": 3,
+  "note": "计算机科学与技术 2024 级培养方案（绑定含互认组的目录版本 3；demo 脚本会按当前版本动态注入）",
+  "required_courses": ["CS101", "CS201", "CS301", "CS401"],
+  "elective_groups": [
+    {
+      "name": "专业选修",
+      "candidates": ["CS303", "CS402"],
+      "min_credits": 3
+    },
+    {
+      "name": "基础拓展",
+      "candidates": ["MATH101", "MATH102", "MATH103"],
+      "min_credits": 6
+    }
+  ]
+}

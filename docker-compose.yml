@@ -1,0 +1,15 @@
+services:
+  planner:
+    build: .
+    image: course-planner:latest
+    container_name: course-planner
+    ports:
+      - "8000:8000"          # 宿主机端口:容器端口，可用 PORTS 覆盖见 README
+    environment:
+      - DB_PATH=/data/app.db # SQLite 数据库文件路径
+    volumes:
+      - planner-data:/data   # 持久化目录版本与规划方案
+    restart: unless-stopped
+
+volumes:
+  planner-data:
